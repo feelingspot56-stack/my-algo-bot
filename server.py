@@ -12,10 +12,10 @@ app = FastAPI(title="Mobile Algo Hub")
 
 state = {
     "mode": "PAPER",
-    "symbol": "^NSEI",
-    "display_symbol": "NIFTY 50",
+    "symbol": "SUZLON.NS",
+    "display_symbol": "SUZLON",
     "paper_balance": 100000.0,
-    "last_price": 23810.0,
+    "last_price": 35.75,
     "positions": [],
     "logs": ["Engine ready. Multi-asset selector active."],
     "strategy": {
@@ -23,12 +23,31 @@ state = {
         "buy_above": 0.0,
         "sell_below": 0.0,
         "qty": 1,
-        "target_pts": 50.0,
-        "trailing_sl_pts": 25.0
+        "target_pts": 5.0,
+        "trailing_sl_pts": 2.0
     }
 }
 
 active_connections: List[WebSocket] = []
+
+# Dictionary mapping popular plain-English commodity/index names to Yahoo tickers
+COMMODITY_ALIASES = {
+    "NATURAL GAS": ("NG=F", "NATURAL GAS"),
+    "NATURALGAS": ("NG=F", "NATURAL GAS"),
+    "NATGAS": ("NG=F", "NATURAL GAS"),
+    "NATURAL GAS MINI": ("NG=F", "NATURAL GAS"),
+    "CRUDE OIL": ("CL=F", "CRUDE OIL"),
+    "CRUDE": ("CL=F", "CRUDE OIL"),
+    "CRUDEOIL": ("CL=F", "CRUDE OIL"),
+    "GOLD": ("GC=F", "GOLD"),
+    "GOLD MINI": ("GC=F", "GOLD"),
+    "SILVER": ("SI=F", "SILVER"),
+    "SILVER MINI": ("SI=F", "SILVER"),
+    "COPPER": ("HG=F", "COPPER"),
+    "NIFTY": ("^NSEI", "NIFTY 50"),
+    "BANKNIFTY": ("^NSEBANK", "BANKNIFTY"),
+    "BANK NIFTY": ("^NSEBANK", "BANKNIFTY"),
+}
 
 async def broadcast_state():
     if active_connections:
@@ -60,7 +79,7 @@ def fetch_price(symbol: str) -> float:
                 if price:
                     return round(float(price), 2)
     except Exception as e:
-        logging.warning(f"Fetch failed for {symbol}: {e}")
+        logging.warning(f"Price fetch failed for {symbol}: {e}")
     return 0.0
 
 def execute_paper_order(side: str, qty: int, price: float):
@@ -82,9 +101,10 @@ def execute_paper_order(side: str, qty: int, price: float):
 
 def evaluate_strategy(price: float):
     strat = state["strategy"]
-    if not strat["active"] or price <= 0:
+    if not strat.get("active", False) or price <= 0:
         return
 
+    # Check exit for long positions
     for pos in list(state["positions"]):
         if pos["side"] == "BUY":
             if price > pos.get("peak_price", pos["entry_price"]):
@@ -107,13 +127,14 @@ def evaluate_strategy(price: float):
                 strat["active"] = False
                 return
 
+    # Check entry trigger
     if len(state["positions"]) == 0:
         if strat["buy_above"] > 0 and price >= strat["buy_above"]:
             execute_paper_order("BUY", strat["qty"], price)
             log_event(f"⚡ Breakout triggered above ₹{strat['buy_above']}!")
             strat["buy_above"] = 0.0
         elif strat["sell_below"] > 0 and price <= strat["sell_below"]:
-            log_event(f"⚠️ Sell level reached below ₹{strat['sell_below']}")
+            log_event(f"⚠️ Price broke below ₹{strat['sell_below']}")
             strat["sell_below"] = 0.0
 
 async def feed_worker():
@@ -128,7 +149,7 @@ async def feed_worker():
                 evaluate_strategy(p)
             await broadcast_state()
         except Exception as e:
-            logging.error(f"Feed error: {e}")
+            logging.error(f"Worker loop error: {e}")
         await asyncio.sleep(4)
 
 @app.on_event("startup")
@@ -151,30 +172,44 @@ async def websocket_endpoint(websocket: WebSocket):
                 log_event(f"Mode set to {state['mode']}")
             
             elif action == "CHANGE_SYMBOL":
-                sym = cmd.get("symbol", "").strip()
+                raw = cmd.get("symbol", "").strip().upper()
                 disp = cmd.get("display", "").strip()
-                if sym:
-                    log_event(f"Requesting feed for {disp or sym}...")
-                    p = await asyncio.to_thread(fetch_price, sym)
-                    if p > 0:
-                        state["symbol"] = sym
-                        state["display_symbol"] = disp if disp else sym
-                        state["last_price"] = p
-                        log_event(f"Tracking {state['display_symbol']} @ ₹{p}")
-                        evaluate_strategy(p)
+
+                # Check smart alias dictionary first
+                if raw in COMMODITY_ALIASES:
+                    sym, disp = COMMODITY_ALIASES[raw]
+                elif raw.replace(" ", "") in COMMODITY_ALIASES:
+                    sym, disp = COMMODITY_ALIASES[raw.replace(" ", "")]
+                else:
+                    if not raw.includes_dot and not raw.startswith("^") and not raw.endswith("=F"):
+                        sym = raw + ".NS"
+                        disp = raw
                     else:
-                        log_event(f"⚠️ Symbol not recognized or closed: {sym}")
+                        sym = raw
+                        disp = disp or raw
+
+                log_event(f"Requesting feed for {disp} ({sym})...")
+                p = await asyncio.to_thread(fetch_price, sym)
+                if p > 0:
+                    state["symbol"] = sym
+                    state["display_symbol"] = disp
+                    state["last_price"] = p
+                    log_event(f"Tracking {disp} @ ₹{p}")
+                    evaluate_strategy(p)
+                else:
+                    log_event(f"⚠️ Cannot fetch price for {disp}. Ticker: {sym}")
 
             elif action == "SAVE_STRATEGY":
                 strat = state["strategy"]
-                strat["buy_above"] = float(cmd.get("buy_above", 0.0))
-                strat["sell_below"] = float(cmd.get("sell_below", 0.0))
-                strat["target_pts"] = float(cmd.get("target_pts", 50.0))
-                strat["trailing_sl_pts"] = float(cmd.get("trailing_sl_pts", 25.0))
-                strat["qty"] = int(cmd.get("qty", 1))
+                strat["buy_above"] = float(cmd.get("buy_above") or 0.0)
+                strat["sell_below"] = float(cmd.get("sell_below") or 0.0)
+                strat["target_pts"] = float(cmd.get("target_pts") or 5.0)
+                strat["trailing_sl_pts"] = float(cmd.get("trailing_sl_pts") or 2.0)
+                strat["qty"] = int(cmd.get("qty") or 1)
                 strat["active"] = bool(cmd.get("active", False))
                 status_txt = "ARMED" if strat["active"] else "PAUSED"
-                log_event(f"Rules set & {status_txt}")
+                log_event(f"Rules set for {state['display_symbol']} & {status_txt}")
+                evaluate_strategy(state["last_price"])
 
             elif action == "ORDER":
                 side = cmd.get("side")
@@ -194,7 +229,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Algo Terminal</title>
   <style>
-    :root { --bg: #090d16; --card: #131b2e; --border: #1f2b45; --up: #10b981; --down: #ef4444; --text: #f1f5f9; --accent: #3b82f6; }
+    :root { --bg: #090d16; --card: #131b2e; --border: #1f2b45; --up: #10b981; --down: #ef4444; --text: #f1f5f9; --accent: #2563eb; }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, system-ui, sans-serif; }
     body { background: var(--bg); color: var(--text); padding: 14px; }
     .header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
@@ -210,12 +245,12 @@ HTML_CONTENT = """<!DOCTYPE html>
     .btn-buy { background: var(--up); }
     .btn-sell { background: var(--down); }
     .btn-mode { background: #1e293b; border: 1px solid var(--border); margin-top: 10px; }
-    .btn-save { background: var(--accent); margin-top: 12px; }
+    .btn-save { background: var(--accent); margin-top: 12px; transition: background 0.2s; }
     .btn-search { background: #3b82f6; padding: 10px 18px; font-size: 14px; width: auto; border-radius: 6px; }
     .log-box { font-size: 12px; max-height: 140px; overflow-y: auto; background: #00000040; border-radius: 6px; padding: 8px; margin-top: 10px; line-height: 1.6; }
     input, select { width: 100%; padding: 10px; background: #0b0f19; color: #fff; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
     label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
-    .toggle-row { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+    .toggle-row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
     .quick-chips { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin-top: 8px; }
     .chip { background: #1e293b; padding: 6px 12px; border-radius: 6px; font-size: 12px; white-space: nowrap; cursor: pointer; border: 1px solid var(--border); }
   </style>
@@ -226,31 +261,34 @@ HTML_CONTENT = """<!DOCTYPE html>
     <span id="modeBadge" class="badge badge-paper">PAPER</span>
   </div>
 
+  <!-- ASSET SELECTOR -->
   <div class="card">
     <label>Search Stock / Commodity</label>
     <div style="display: flex; gap: 8px; margin-top: 6px;">
-      <input id="customSymbol" type="text" placeholder="e.g. SUZLON, INFY, SBIN" style="text-transform:uppercase;">
+      <input id="customSymbol" type="text" placeholder="e.g. SUZLON, NATGAS, GOLD, INFY" style="text-transform:uppercase;">
       <button id="loadBtn" class="btn-search" onclick="loadCustomAsset()">Load</button>
     </div>
     <div class="quick-chips">
       <div class="chip" onclick="setPreset('SUZLON.NS', 'SUZLON')">⚡ Suzlon</div>
+      <div class="chip" onclick="setPreset('NG=F', 'NATURAL GAS')">🔥 NatGas</div>
+      <div class="chip" onclick="setPreset('CL=F', 'CRUDE OIL')">🛢️ Crude</div>
+      <div class="chip" onclick="setPreset('GC=F', 'GOLD')">🪙 Gold</div>
       <div class="chip" onclick="setPreset('^NSEI', 'NIFTY 50')">NIFTY 50</div>
-      <div class="chip" onclick="setPreset('^NSEBANK', 'BANKNIFTY')">BANKNIFTY</div>
       <div class="chip" onclick="setPreset('TATAMOTORS.NS', 'TATAMOTORS')">Tata Motors</div>
       <div class="chip" onclick="setPreset('RELIANCE.NS', 'RELIANCE')">Reliance</div>
-      <div class="chip" onclick="setPreset('GC=F', 'GOLD')">Gold</div>
-      <div class="chip" onclick="setPreset('CL=F', 'CRUDE OIL')">Crude Oil</div>
     </div>
   </div>
 
+  <!-- LIVE PRICE -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
-      <span style="font-size: 12px; color: #94a3b8;" id="symLabel">NIFTY 50 (Live)</span>
+      <span style="font-size: 12px; color: #94a3b8;" id="symLabel">SUZLON (Live)</span>
     </div>
     <div class="price-lg" id="ltp">Connecting...</div>
     <div style="font-size: 13px; margin-top: 6px;">Virtual Margin: <b id="bal">₹1,00,000</b></div>
   </div>
 
+  <!-- BREAKOUT AUTOMATION -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
       <span style="font-size: 14px; font-weight: 700;">⚡ Breakout Automation</span>
@@ -261,33 +299,34 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="grid" style="margin-top: 10px;">
       <div>
         <label>Buy Above (₹)</label>
-        <input id="inBuyAbove" type="number" step="0.05" placeholder="e.g. 55.50">
+        <input id="inBuyAbove" type="number" step="0.05" placeholder="e.g. 36.00">
       </div>
       <div>
         <label>Sell Below (₹)</label>
-        <input id="inSellBelow" type="number" step="0.05" placeholder="e.g. 50.00">
+        <input id="inSellBelow" type="number" step="0.05" placeholder="e.g. 35.00">
       </div>
     </div>
 
     <div class="grid" style="margin-top: 8px;">
       <div>
         <label>Target (Points / ₹)</label>
-        <input id="inTarget" type="number" step="0.1" value="2">
+        <input id="inTarget" type="number" step="0.05" value="2">
       </div>
       <div>
         <label>Trailing SL (Points / ₹)</label>
-        <input id="inSL" type="number" step="0.1" value="1">
+        <input id="inSL" type="number" step="0.05" value="1">
       </div>
     </div>
 
-    <div class="toggle-row" style="margin-top: 12px;">
+    <div class="toggle-row">
       <label style="font-size: 13px; color: #fff;">Activate Strategy</label>
-      <input id="stratActive" type="checkbox" style="width: 22px; height: 22px;">
+      <input id="stratActive" type="checkbox" style="width: 24px; height: 24px; cursor: pointer;">
     </div>
 
-    <button class="btn-save" onclick="saveStrategy()">Save & Arm Rules</button>
+    <button id="btnSave" class="btn-save" onclick="saveStrategy()">Save & Arm Rules</button>
   </div>
 
+  <!-- MANUAL BUTTONS -->
   <div class="card">
     <div style="font-size: 13px; font-weight: 600;">Manual / Instant Signal</div>
     <div class="grid">
@@ -297,11 +336,13 @@ HTML_CONTENT = """<!DOCTYPE html>
     <button class="btn-mode" onclick="toggle()">Switch Paper / Live</button>
   </div>
 
+  <!-- OPEN POSITIONS -->
   <div class="card">
     <div style="font-size: 13px; font-weight: 600;">Open Positions (<span id="count">0</span>)</div>
     <div id="positions" style="margin-top: 8px; font-size: 13px; color: #94a3b8;">No open trades.</div>
   </div>
 
+  <!-- LOGS -->
   <div class="card">
     <div style="font-size: 13px; font-weight: 600;">Execution Activity</div>
     <div class="log-box" id="logs">Connecting to server...</div>
@@ -331,19 +372,20 @@ HTML_CONTENT = """<!DOCTYPE html>
         sBadge.className = 'badge badge-idle';
       }
 
+      // Sync inputs initially on first connection
       if (!stratLoaded && d.strategy) {
-        document.getElementById('inBuyAbove').value = d.strategy.buy_above || '';
-        document.getElementById('inSellBelow').value = d.strategy.sell_below || '';
+        if (d.strategy.buy_above) document.getElementById('inBuyAbove').value = d.strategy.buy_above;
+        if (d.strategy.sell_below) document.getElementById('inSellBelow').value = d.strategy.sell_below;
         document.getElementById('inTarget').value = d.strategy.target_pts || 2;
         document.getElementById('inSL').value = d.strategy.trailing_sl_pts || 1;
-        document.getElementById('stratActive').checked = d.strategy.active;
+        document.getElementById('stratActive').checked = Boolean(d.strategy.active);
         stratLoaded = true;
       }
 
       document.getElementById('count').innerText = d.positions.length;
       document.getElementById('positions').innerHTML = d.positions.length ? d.positions.map(p => 
         `<div style="display:flex; justify-content:space-between; margin-bottom:4px; color:#fff;">
-           <span>${p.qty}x ${p.symbol} @ ₹${p.entry_price.toFixed(1)}</span>
+           <span>${p.qty}x ${p.symbol} @ ₹${p.entry_price.toFixed(2)}</span>
            <span style="color:${p.pnl >= 0 ? 'var(--up)':'var(--down)'}">₹${p.pnl.toFixed(2)}</span>
          </div>`
       ).join('') : 'No open trades.';
@@ -366,29 +408,38 @@ HTML_CONTENT = """<!DOCTYPE html>
       ws.send(JSON.stringify({ action: 'CHANGE_SYMBOL', symbol: sym, display: disp }));
     }
     function loadCustomAsset() {
-      let raw = document.getElementById('customSymbol').value.trim().toUpperCase();
+      let raw = document.getElementById('customSymbol').value.trim();
       if (!raw) return;
 
       const loadBtn = document.getElementById('loadBtn');
       if (loadBtn) loadBtn.innerText = 'Loading...';
 
-      let sym = raw;
-      let disp = raw;
-
-      if (!raw.includes('.') && !raw.startsWith('^') && !raw.includes('=')) {
-        sym = raw + '.NS';
-      }
-      ws.send(JSON.stringify({ action: 'CHANGE_SYMBOL', symbol: sym, display: disp }));
+      ws.send(JSON.stringify({ action: 'CHANGE_SYMBOL', symbol: raw, display: raw.toUpperCase() }));
       document.getElementById('customSymbol').value = '';
     }
     function saveStrategy() {
+      const activeChecked = document.getElementById('stratActive').checked;
+      const btn = document.getElementById('btnSave');
+      btn.innerText = 'Saved!';
+      setTimeout(() => { btn.innerText = 'Save & Arm Rules'; }, 1000);
+
+      // Instantly update badge visually
+      const sBadge = document.getElementById('stratStatusBadge');
+      if (activeChecked) {
+        sBadge.innerText = 'ARMED';
+        sBadge.className = 'badge badge-active';
+      } else {
+        sBadge.innerText = 'PAUSED';
+        sBadge.className = 'badge badge-idle';
+      }
+
       const payload = {
         action: 'SAVE_STRATEGY',
-        buy_above: document.getElementById('inBuyAbove').value,
-        sell_below: document.getElementById('inSellBelow').value,
-        target_pts: document.getElementById('inTarget').value,
-        trailing_sl_pts: document.getElementById('inSL').value,
-        active: document.getElementById('stratActive').checked,
+        buy_above: parseFloat(document.getElementById('inBuyAbove').value) || 0.0,
+        sell_below: parseFloat(document.getElementById('inSellBelow').value) || 0.0,
+        target_pts: parseFloat(document.getElementById('inTarget').value) || 5.0,
+        trailing_sl_pts: parseFloat(document.getElementById('inSL').value) || 2.0,
+        active: activeChecked,
         qty: 1
       };
       ws.send(JSON.stringify(payload));
