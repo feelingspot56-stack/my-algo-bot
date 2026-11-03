@@ -3,28 +3,20 @@ import json
 import logging
 from typing import List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse
-from kiteconnect import KiteConnect, KiteTicker
+from fastapi.responses import HTMLResponse
+import yfinance as yf
 
 logging.basicConfig(level=logging.INFO)
 
-# ================= CONFIGURATION =================
-API_KEY = "YOUR_KITE_API_KEY"
-API_SECRET = "YOUR_KITE_API_SECRET"
-REDIRECT_URL = "http://localhost:8000/callback"
-INSTRUMENT_TOKENS = [256265]  # NIFTY 50
-# =================================================
-
 app = FastAPI(title="Mobile Algo Hub")
-kite = KiteConnect(api_key=API_KEY)
-kws = None
 
+# State management
 state = {
-    "authenticated": False,
-    "mode": "PAPER",  # "PAPER" or "LIVE"
+    "mode": "PAPER",
+    "symbol": "^NSEI",          # Yahoo ticker for NIFTY 50
+    "display_symbol": "NIFTY 50",
     "paper_balance": 100000.0,
     "last_price": 0.0,
-    "symbol": "NIFTY",
     "positions": [],
     "logs": []
 }
@@ -45,42 +37,35 @@ def log_event(message: str):
     if len(state["logs"]) > 25:
         state["logs"].pop()
 
-def on_ticks(ws, ticks):
-    for tick in ticks:
-        ltp = tick.get("last_price", 0.0)
-        state["last_price"] = ltp
-        for pos in state["positions"]:
-            pos["ltp"] = ltp
-            pos["pnl"] = round((ltp - pos["entry_price"]) * pos["qty"], 2)
-    asyncio.run(broadcast_state())
+# Background live price fetcher
+async def live_feed_worker():
+    while True:
+        try:
+            ticker = yf.Ticker(state["symbol"])
+            # Fast price check from fast_info
+            price = ticker.fast_info.get("last_price")
+            if not price:
+                data = ticker.history(period="1d", interval="1m")
+                if not data.empty:
+                    price = float(data["Close"].iloc[-1])
 
-def on_connect(ws, response):
-    logging.info("Connected to KiteTicker WebSockets.")
-    ws.subscribe(INSTRUMENT_TOKENS)
-    ws.set_mode(ws.MODE_LTP, INSTRUMENT_TOKENS)
+            if price and price > 0:
+                state["last_price"] = round(float(price), 2)
+                # Recalculate paper positions PnL
+                for pos in state["positions"]:
+                    pos["ltp"] = state["last_price"]
+                    pos["pnl"] = round((state["last_price"] - pos["entry_price"]) * pos["qty"], 2)
 
-@app.get("/login")
-def login():
-    return RedirectResponse(kite.login_url())
+                await broadcast_state()
+        except Exception as e:
+            logging.error(f"Data fetch error: {e}")
 
-@app.get("/callback")
-def callback(request_token: str):
-    global kws
-    try:
-        session = kite.generate_session(request_token, api_secret=API_SECRET)
-        access_token = session["access_token"]
-        kite.set_access_token(access_token)
-        state["authenticated"] = True
-        log_event("Kite Connect linked successfully.")
+        # Polls live price every 3 seconds
+        await asyncio.sleep(3)
 
-        kws = KiteTicker(API_KEY, access_token)
-        kws.on_ticks = on_ticks
-        kws.on_connect = on_connect
-        kws.connect(threaded=True)
-
-        return RedirectResponse("/")
-    except Exception as e:
-        return HTMLResponse(f"<h3>Login error: {e}</h3>")
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(live_feed_worker())
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -95,44 +80,38 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if action == "TOGGLE_MODE":
                 state["mode"] = "LIVE" if state["mode"] == "PAPER" else "PAPER"
-                log_event(f"Mode switched to {state['mode']}")
+                log_event(f"Switched mode to {state['mode']}")
             
+            elif action == "CHANGE_SYMBOL":
+                sym = cmd.get("symbol", "^NSEI")
+                disp = cmd.get("display", "NIFTY 50")
+                state["symbol"] = sym
+                state["display_symbol"] = disp
+                log_event(f"Changed ticker to {disp}")
+
             elif action == "ORDER":
                 side = cmd.get("side")
                 qty = int(cmd.get("qty", 1))
-                sym = cmd.get("symbol", state["symbol"])
+                sym = state["display_symbol"]
                 price = state["last_price"]
 
-                if state["mode"] == "PAPER":
-                    cost = price * qty
-                    if side == "BUY":
-                        state["paper_balance"] -= cost
-                        state["positions"].append({
-                            "symbol": sym, "side": "BUY", "qty": qty, 
-                            "entry_price": price, "ltp": price, "pnl": 0.0
-                        })
-                        log_event(f"[PAPER] Bought {qty} {sym} @ ₹{price}")
-                    elif side == "SELL" and state["positions"]:
-                        p = state["positions"].pop(0)
-                        pnl = (price - p["entry_price"]) * p["qty"]
-                        state["paper_balance"] += (p["entry_price"] * p["qty"]) + pnl
-                        log_event(f"[PAPER] Sold {qty} {sym} @ ₹{price} | P&L: ₹{pnl:.2f}")
-
-                elif state["mode"] == "LIVE":
-                    try:
-                        tx = kite.TRANSACTION_TYPE_BUY if side == "BUY" else kite.TRANSACTION_TYPE_SELL
-                        order_id = kite.place_order(
-                            variety=kite.VARIETY_REGULAR,
-                            exchange=kite.EXCHANGE_NSE,
-                            tradingsymbol=sym,
-                            transaction_type=tx,
-                            quantity=qty,
-                            product=kite.PRODUCT_MIS,
-                            order_type=kite.ORDER_TYPE_MARKET
-                        )
-                        log_event(f"[LIVE] Order #{order_id} ({side} {qty} {sym})")
-                    except Exception as err:
-                        log_event(f"[LIVE ERROR] {err}")
+                if price <= 0:
+                    log_event("Cannot place order: Price feed not ready.")
+                else:
+                    if state["mode"] == "PAPER":
+                        cost = price * qty
+                        if side == "BUY":
+                            state["paper_balance"] -= cost
+                            state["positions"].append({
+                                "symbol": sym, "side": "BUY", "qty": qty, 
+                                "entry_price": price, "ltp": price, "pnl": 0.0
+                            })
+                            log_event(f"[PAPER] Bought {qty} {sym} @ ₹{price}")
+                        elif side == "SELL" and state["positions"]:
+                            p = state["positions"].pop(0)
+                            pnl = (price - p["entry_price"]) * p["qty"]
+                            state["paper_balance"] += (p["entry_price"] * p["qty"]) + pnl
+                            log_event(f"[PAPER] Sold {qty} {sym} @ ₹{price} | P&L: ₹{pnl:.2f}")
 
             await broadcast_state()
     except WebSocketDisconnect:
@@ -165,6 +144,7 @@ HTML_CONTENT = """
     .btn-sell { background: var(--down); }
     .btn-mode { background: #1e293b; border: 1px solid var(--border); margin-top: 10px; }
     .log-box { font-size: 12px; max-height: 140px; overflow-y: auto; background: #00000040; border-radius: 6px; padding: 8px; margin-top: 10px; line-height: 1.6; }
+    select { width: 100%; padding: 8px; background: #0b0f19; color: #fff; border: 1px solid var(--border); border-radius: 6px; margin-top: 6px; }
   </style>
 </head>
 <body>
@@ -174,8 +154,17 @@ HTML_CONTENT = """
   </div>
 
   <div class="card">
-    <div style="font-size: 12px; color: #94a3b8;">NSE Live Feed (LTP)</div>
-    <div class="price-lg" id="ltp">₹0.00</div>
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-size: 12px; color: #94a3b8;" id="symLabel">NIFTY 50 (Live)</span>
+      <select id="tickerSelect" onchange="changeTicker(this)">
+        <option value="^NSEI|NIFTY 50">NIFTY 50</option>
+        <option value="^NSEBANK|BANKNIFTY">BANKNIFTY</option>
+        <option value="RELIANCE.NS|RELIANCE">RELIANCE</option>
+        <option value="TATAMOTORS.NS|TATAMOTORS">TATAMOTORS</option>
+        <option value="TCS.NS|TCS">TCS</option>
+      </select>
+    </div>
+    <div class="price-lg" id="ltp">Connecting...</div>
     <div style="font-size: 13px; margin-top: 6px;">Virtual Margin: <b id="bal">₹1,00,000</b></div>
   </div>
 
@@ -186,9 +175,6 @@ HTML_CONTENT = """
       <button class="btn-sell" onclick="order('SELL')">SELL (MIS)</button>
     </div>
     <button class="btn-mode" onclick="toggle()">Switch Paper / Live</button>
-    <a href="/login" style="display:block; text-align:center; color:#60a5fa; margin-top:12px; font-size:12px; text-decoration:none;">
-      🔑 Re-authenticate Kite Session
-    </a>
   </div>
 
   <div class="card">
@@ -207,7 +193,8 @@ HTML_CONTENT = """
 
     ws.onmessage = (e) => {
       const d = JSON.parse(e.data);
-      document.getElementById('ltp').innerText = '₹' + (d.last_price || 0).toFixed(2);
+      document.getElementById('symLabel').innerText = d.display_symbol + ' (Live)';
+      document.getElementById('ltp').innerText = d.last_price > 0 ? '₹' + d.last_price.toFixed(2) : 'Fetching live price...';
       document.getElementById('bal').innerText = '₹' + d.paper_balance.toLocaleString('en-IN');
       
       const badge = document.getElementById('modeBadge');
@@ -231,11 +218,10 @@ HTML_CONTENT = """
     function toggle() {
       ws.send(JSON.stringify({ action: 'TOGGLE_MODE' }));
     }
+    function changeTicker(el) {
+      const [sym, disp] = el.value.split('|');
+      ws.send(JSON.stringify({ action: 'CHANGE_SYMBOL', symbol: sym, display: disp }));
+    }
   </script>
 </body>
 </html>
-"""
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
