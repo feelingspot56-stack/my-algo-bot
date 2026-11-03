@@ -30,7 +30,6 @@ state = {
 
 active_connections: List[WebSocket] = []
 
-# Dictionary mapping popular plain-English commodity/index names to Yahoo tickers
 COMMODITY_ALIASES = {
     "NATURAL GAS": ("NG=F", "NATURAL GAS"),
     "NATURALGAS": ("NG=F", "NATURAL GAS"),
@@ -104,7 +103,6 @@ def evaluate_strategy(price: float):
     if not strat.get("active", False) or price <= 0:
         return
 
-    # Check exit for long positions
     for pos in list(state["positions"]):
         if pos["side"] == "BUY":
             if price > pos.get("peak_price", pos["entry_price"]):
@@ -127,7 +125,6 @@ def evaluate_strategy(price: float):
                 strat["active"] = False
                 return
 
-    # Check entry trigger
     if len(state["positions"]) == 0:
         if strat["buy_above"] > 0 and price >= strat["buy_above"]:
             execute_paper_order("BUY", strat["qty"], price)
@@ -175,13 +172,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 raw = cmd.get("symbol", "").strip().upper()
                 disp = cmd.get("display", "").strip()
 
-                # Check smart alias dictionary first
                 if raw in COMMODITY_ALIASES:
                     sym, disp = COMMODITY_ALIASES[raw]
                 elif raw.replace(" ", "") in COMMODITY_ALIASES:
                     sym, disp = COMMODITY_ALIASES[raw.replace(" ", "")]
                 else:
-                    if not raw.includes_dot and not raw.startswith("^") and not raw.endswith("=F"):
+                    if "." not in raw and not raw.startswith("^") and not raw.endswith("=F"):
                         sym = raw + ".NS"
                         disp = raw
                     else:
@@ -206,7 +202,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 strat["target_pts"] = float(cmd.get("target_pts") or 5.0)
                 strat["trailing_sl_pts"] = float(cmd.get("trailing_sl_pts") or 2.0)
                 strat["qty"] = int(cmd.get("qty") or 1)
-                strat["active"] = bool(cmd.get("active", False))
+                strat["active"] = bool(cmd.get("active", True))
                 status_txt = "ARMED" if strat["active"] else "PAUSED"
                 log_event(f"Rules set for {state['display_symbol']} & {status_txt}")
                 evaluate_strategy(state["last_price"])
@@ -372,7 +368,6 @@ HTML_CONTENT = """<!DOCTYPE html>
         sBadge.className = 'badge badge-idle';
       }
 
-      // Sync inputs initially on first connection
       if (!stratLoaded && d.strategy) {
         if (d.strategy.buy_above) document.getElementById('inBuyAbove').value = d.strategy.buy_above;
         if (d.strategy.sell_below) document.getElementById('inSellBelow').value = d.strategy.sell_below;
@@ -392,6 +387,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       document.getElementById('logs').innerHTML = d.logs.map(l => `<div>• ${l}</div>`).join('');
       
+      // Always reset the load button text back to Load
       const loadBtn = document.getElementById('loadBtn');
       if (loadBtn) loadBtn.innerText = 'Load';
     };
@@ -418,20 +414,21 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById('customSymbol').value = '';
     }
     function saveStrategy() {
-      const activeChecked = document.getElementById('stratActive').checked;
-      const btn = document.getElementById('btnSave');
-      btn.innerText = 'Saved!';
-      setTimeout(() => { btn.innerText = 'Save & Arm Rules'; }, 1000);
+      // Force checkbox to true when Save & Arm is clicked
+      const chk = document.getElementById('stratActive');
+      chk.checked = true;
 
-      // Instantly update badge visually
+      const btn = document.getElementById('btnSave');
+      btn.innerText = 'Armed & Saved!';
+      btn.style.background = '#10b981';
+      setTimeout(() => { 
+        btn.innerText = 'Save & Arm Rules'; 
+        btn.style.background = 'var(--accent)';
+      }, 1200);
+
       const sBadge = document.getElementById('stratStatusBadge');
-      if (activeChecked) {
-        sBadge.innerText = 'ARMED';
-        sBadge.className = 'badge badge-active';
-      } else {
-        sBadge.innerText = 'PAUSED';
-        sBadge.className = 'badge badge-idle';
-      }
+      sBadge.innerText = 'ARMED';
+      sBadge.className = 'badge badge-active';
 
       const payload = {
         action: 'SAVE_STRATEGY',
@@ -439,7 +436,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         sell_below: parseFloat(document.getElementById('inSellBelow').value) || 0.0,
         target_pts: parseFloat(document.getElementById('inTarget').value) || 5.0,
         trailing_sl_pts: parseFloat(document.getElementById('inSL').value) || 2.0,
-        active: activeChecked,
+        active: true,
         qty: 1
       };
       ws.send(JSON.stringify(payload));
