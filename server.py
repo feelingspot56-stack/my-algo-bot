@@ -17,7 +17,7 @@ state = {
     "paper_balance": 100000.0,
     "last_price": 23810.0,
     "positions": [],
-    "logs": ["Engine ready. Multi-asset selector loaded."],
+    "logs": ["Engine ready. Multi-asset selector active."],
     "strategy": {
         "active": False,
         "buy_above": 0.0,
@@ -179,12 +179,7 @@ async def websocket_endpoint(websocket: WebSocket):
         if websocket in active_connections:
             active_connections.remove(websocket)
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return HTML_CONTENT
-
-HTML_CONTENT = """
-<!DOCTYPE html>
+HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -223,27 +218,23 @@ HTML_CONTENT = """
     <span id="modeBadge" class="badge badge-paper">PAPER</span>
   </div>
 
-  <!-- ASSET SEARCH / SELECTOR -->
   <div class="card">
     <label>Select Asset / Stock / Commodity</label>
     <div style="display: flex; gap: 8px; margin-top: 6px;">
-      <input id="customSymbol" type="text" placeholder="e.g. INFY, SBIN, GOLD, CRUDEOIL" style="text-transform:uppercase;">
+      <input id="customSymbol" type="text" placeholder="e.g. INFY, SBIN, GOLD" style="text-transform:uppercase;">
       <button class="btn-search" onclick="loadCustomAsset()">Load</button>
     </div>
-
-    <!-- Quick select chips -->
     <div class="quick-chips">
       <div class="chip" onclick="setPreset('^NSEI', 'NIFTY 50')">NIFTY 50</div>
       <div class="chip" onclick="setPreset('^NSEBANK', 'BANKNIFTY')">BANKNIFTY</div>
       <div class="chip" onclick="setPreset('RELIANCE.NS', 'RELIANCE')">Reliance</div>
       <div class="chip" onclick="setPreset('TATAMOTORS.NS', 'TATAMOTORS')">Tata Motors</div>
-      <div class="chip" onclick="setPreset('GC=F', 'GOLD')">Gold (GC)</div>
-      <div class="chip" onclick="setPreset('CL=F', 'CRUDE OIL')">Crude Oil (CL)</div>
-      <div class="chip" onclick="setPreset('SI=F', 'SILVER')">Silver (SI)</div>
+      <div class="chip" onclick="setPreset('GC=F', 'GOLD')">Gold</div>
+      <div class="chip" onclick="setPreset('CL=F', 'CRUDE OIL')">Crude Oil</div>
+      <div class="chip" onclick="setPreset('SI=F', 'SILVER')">Silver</div>
     </div>
   </div>
 
-  <!-- LIVE PRICE CARD -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
       <span style="font-size: 12px; color: #94a3b8;" id="symLabel">NIFTY 50 (Live)</span>
@@ -252,7 +243,6 @@ HTML_CONTENT = """
     <div style="font-size: 13px; margin-top: 6px;">Virtual Margin: <b id="bal">₹1,00,000</b></div>
   </div>
 
-  <!-- BREAKOUT AUTOMATION CARD -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
       <span style="font-size: 14px; font-weight: 700;">⚡ Breakout Automation</span>
@@ -290,7 +280,6 @@ HTML_CONTENT = """
     <button class="btn-save" onclick="saveStrategy()">Save & Arm Rules</button>
   </div>
 
-  <!-- MANUAL BUTTONS -->
   <div class="card">
     <div style="font-size: 13px; font-weight: 600;">Manual / Instant Signal</div>
     <div class="grid">
@@ -326,7 +315,7 @@ HTML_CONTENT = """
       badge.className = d.mode === 'LIVE' ? 'badge badge-live' : 'badge badge-paper';
 
       const sBadge = document.getElementById('stratStatusBadge');
-      if (d.strategy.active) {
+      if (d.strategy && d.strategy.active) {
         sBadge.innerText = 'ARMED';
         sBadge.className = 'badge badge-active';
       } else {
@@ -346,7 +335,7 @@ HTML_CONTENT = """
       document.getElementById('count').innerText = d.positions.length;
       document.getElementById('positions').innerHTML = d.positions.length ? d.positions.map(p => 
         `<div style="display:flex; justify-content:space-between; margin-bottom:4px; color:#fff;">
-           <span>${p.qty}x ${p.symbol} @ ₹${p.entry_price.toFixed(1)} (Peak ₹${(p.peak_price||p.entry_price).toFixed(1)})</span>
+           <span>${p.qty}x ${p.symbol} @ ₹${p.entry_price.toFixed(1)}</span>
            <span style="color:${p.pnl >= 0 ? 'var(--up)':'var(--down)'}">₹${p.pnl.toFixed(2)}</span>
          </div>`
       ).join('') : 'No open trades.';
@@ -370,7 +359,6 @@ HTML_CONTENT = """
       let sym = input;
       let disp = input;
 
-      // Automatically append .NS for Indian stocks if not provided
       if (!input.includes('.') && !input.startsWith('^') && !input.includes('=')) {
         sym = input + '.NS';
       }
@@ -392,3 +380,12 @@ HTML_CONTENT = """
   </script>
 </body>
 </html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTML_CONTENT
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
