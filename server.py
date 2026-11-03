@@ -17,16 +17,14 @@ state = {
     "paper_balance": 100000.0,
     "last_price": 23810.0,
     "positions": [],
-    "logs": ["Engine armed. Breakout strategy loaded."],
-    # --- Breakout Strategy Rules ---
+    "logs": ["Engine ready. Multi-asset selector loaded."],
     "strategy": {
         "active": False,
         "buy_above": 0.0,
         "sell_below": 0.0,
         "qty": 1,
         "target_pts": 50.0,
-        "trailing_sl_pts": 25.0,
-        "highest_price_seen": 0.0
+        "trailing_sl_pts": 25.0
     }
 }
 
@@ -57,7 +55,7 @@ def fetch_price(symbol: str) -> float:
             if price:
                 return round(float(price), 2)
     except Exception as e:
-        logging.warning(f"Price fetch: {e}")
+        logging.warning(f"Price fetch failed for {symbol}: {e}")
     return 0.0
 
 def execute_paper_order(side: str, qty: int, price: float):
@@ -82,10 +80,8 @@ def evaluate_strategy(price: float):
     if not strat["active"] or price <= 0:
         return
 
-    # 1. Manage Existing Open Long Positions (Target & Trailing SL)
     for pos in list(state["positions"]):
         if pos["side"] == "BUY":
-            # Track peak price reached during trade
             if price > pos.get("peak_price", pos["entry_price"]):
                 pos["peak_price"] = price
 
@@ -94,32 +90,25 @@ def evaluate_strategy(price: float):
             target = entry + strat["target_pts"]
             trailing_stop = peak - strat["trailing_sl_pts"]
 
-            # Target hit
             if price >= target:
                 execute_paper_order("SELL", pos["qty"], price)
                 log_event(f"🎯 Target hit at ₹{price} (+{strat['target_pts']} pts)!")
                 strat["active"] = False
                 return
 
-            # Trailing Stop-Loss hit
             if price <= trailing_stop:
                 execute_paper_order("SELL", pos["qty"], price)
                 log_event(f"🛑 Trailing SL hit at ₹{price} (Peak: ₹{peak})")
                 strat["active"] = False
                 return
 
-    # 2. Check Breakout Entry if no open position
     if len(state["positions"]) == 0:
-        # Buy breakout
         if strat["buy_above"] > 0 and price >= strat["buy_above"]:
             execute_paper_order("BUY", strat["qty"], price)
-            log_event(f"⚡ Breakout confirmed above ₹{strat['buy_above']}!")
-            # Reset triggers so it doesn't double enter
+            log_event(f"⚡ Breakout triggered above ₹{strat['buy_above']}!")
             strat["buy_above"] = 0.0
-
-        # Sell below
         elif strat["sell_below"] > 0 and price <= strat["sell_below"]:
-            log_event(f"⚠️ Breakdown alert: Price dropped below ₹{strat['sell_below']}")
+            log_event(f"⚠️ Sell level hit below ₹{strat['sell_below']}")
             strat["sell_below"] = 0.0
 
 async def feed_worker():
@@ -134,7 +123,7 @@ async def feed_worker():
                 evaluate_strategy(p)
             await broadcast_state()
         except Exception as e:
-            logging.error(f"Worker loop error: {e}")
+            logging.error(f"Worker loop: {e}")
         await asyncio.sleep(4)
 
 @app.on_event("startup")
@@ -157,15 +146,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 log_event(f"Mode switched to {state['mode']}")
             
             elif action == "CHANGE_SYMBOL":
-                sym = cmd.get("symbol", "^NSEI")
-                disp = cmd.get("display", "NIFTY 50")
-                state["symbol"] = sym
-                state["display_symbol"] = disp
-                log_event(f"Tracking {disp}")
-                p = await asyncio.to_thread(fetch_price, sym)
-                if p > 0:
-                    state["last_price"] = p
-                    evaluate_strategy(p)
+                sym = cmd.get("symbol", "").strip()
+                disp = cmd.get("display", "").strip()
+                if sym:
+                    state["symbol"] = sym
+                    state["display_symbol"] = disp if disp else sym
+                    log_event(f"Switched asset to {state['display_symbol']}")
+                    p = await asyncio.to_thread(fetch_price, sym)
+                    if p > 0:
+                        state["last_price"] = p
+                        evaluate_strategy(p)
 
             elif action == "SAVE_STRATEGY":
                 strat = state["strategy"]
@@ -175,8 +165,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 strat["trailing_sl_pts"] = float(cmd.get("trailing_sl_pts", 25.0))
                 strat["qty"] = int(cmd.get("qty", 1))
                 strat["active"] = bool(cmd.get("active", False))
-                status_txt = "ACTIVATED" if strat["active"] else "PAUSED"
-                log_event(f"Strategy rules saved & {status_txt}")
+                status_txt = "ARMED" if strat["active"] else "PAUSED"
+                log_event(f"Rules updated & {status_txt}")
 
             elif action == "ORDER":
                 side = cmd.get("side")
@@ -218,10 +208,13 @@ HTML_CONTENT = """
     .btn-sell { background: var(--down); }
     .btn-mode { background: #1e293b; border: 1px solid var(--border); margin-top: 10px; }
     .btn-save { background: var(--accent); margin-top: 12px; }
+    .btn-search { background: #334155; padding: 10px 14px; font-size: 13px; width: auto; border-radius: 6px; }
     .log-box { font-size: 12px; max-height: 140px; overflow-y: auto; background: #00000040; border-radius: 6px; padding: 8px; margin-top: 10px; line-height: 1.6; }
-    input, select { width: 100%; padding: 10px; background: #0b0f19; color: #fff; border: 1px solid var(--border); border-radius: 6px; margin-top: 4px; font-size: 14px; }
+    input, select { width: 100%; padding: 10px; background: #0b0f19; color: #fff; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
     label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
     .toggle-row { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+    .quick-chips { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin-top: 8px; }
+    .chip { background: #1e293b; padding: 5px 10px; border-radius: 6px; font-size: 12px; white-space: nowrap; cursor: pointer; border: 1px solid var(--border); }
   </style>
 </head>
 <body>
@@ -230,37 +223,51 @@ HTML_CONTENT = """
     <span id="modeBadge" class="badge badge-paper">PAPER</span>
   </div>
 
+  <!-- ASSET SEARCH / SELECTOR -->
+  <div class="card">
+    <label>Select Asset / Stock / Commodity</label>
+    <div style="display: flex; gap: 8px; margin-top: 6px;">
+      <input id="customSymbol" type="text" placeholder="e.g. INFY, SBIN, GOLD, CRUDEOIL" style="text-transform:uppercase;">
+      <button class="btn-search" onclick="loadCustomAsset()">Load</button>
+    </div>
+
+    <!-- Quick select chips -->
+    <div class="quick-chips">
+      <div class="chip" onclick="setPreset('^NSEI', 'NIFTY 50')">NIFTY 50</div>
+      <div class="chip" onclick="setPreset('^NSEBANK', 'BANKNIFTY')">BANKNIFTY</div>
+      <div class="chip" onclick="setPreset('RELIANCE.NS', 'RELIANCE')">Reliance</div>
+      <div class="chip" onclick="setPreset('TATAMOTORS.NS', 'TATAMOTORS')">Tata Motors</div>
+      <div class="chip" onclick="setPreset('GC=F', 'GOLD')">Gold (GC)</div>
+      <div class="chip" onclick="setPreset('CL=F', 'CRUDE OIL')">Crude Oil (CL)</div>
+      <div class="chip" onclick="setPreset('SI=F', 'SILVER')">Silver (SI)</div>
+    </div>
+  </div>
+
+  <!-- LIVE PRICE CARD -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
       <span style="font-size: 12px; color: #94a3b8;" id="symLabel">NIFTY 50 (Live)</span>
-      <select id="tickerSelect" style="width: auto; padding: 6px 10px;" onchange="changeTicker(this)">
-        <option value="^NSEI|NIFTY 50">NIFTY 50</option>
-        <option value="^NSEBANK|BANKNIFTY">BANKNIFTY</option>
-        <option value="RELIANCE.NS|RELIANCE">RELIANCE</option>
-        <option value="TATAMOTORS.NS|TATAMOTORS">TATAMOTORS</option>
-        <option value="TCS.NS|TCS">TCS</option>
-      </select>
     </div>
-    <div class="price-lg" id="ltp">₹23,810.00</div>
+    <div class="price-lg" id="ltp">Connecting...</div>
     <div style="font-size: 13px; margin-top: 6px;">Virtual Margin: <b id="bal">₹1,00,000</b></div>
   </div>
 
-  <!-- AUTOMATED STRATEGY CARD -->
+  <!-- BREAKOUT AUTOMATION CARD -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
       <span style="font-size: 14px; font-weight: 700;">⚡ Breakout Automation</span>
       <span id="stratStatusBadge" class="badge badge-idle">PAUSED</span>
     </div>
-    <p style="font-size: 11px; color: #94a3b8; margin-top: 4px;">Set rules once. Executes automatically when price levels hit.</p>
+    <p style="font-size: 11px; color: #94a3b8; margin-top: 4px;">Executes automatically on price trigger.</p>
 
     <div class="grid" style="margin-top: 10px;">
       <div>
         <label>Buy Above (₹)</label>
-        <input id="inBuyAbove" type="number" step="0.5" placeholder="e.g. 23850">
+        <input id="inBuyAbove" type="number" step="0.05" placeholder="e.g. 23850">
       </div>
       <div>
         <label>Sell Below (₹)</label>
-        <input id="inSellBelow" type="number" step="0.5" placeholder="e.g. 23750">
+        <input id="inSellBelow" type="number" step="0.05" placeholder="e.g. 23750">
       </div>
     </div>
 
@@ -283,6 +290,7 @@ HTML_CONTENT = """
     <button class="btn-save" onclick="saveStrategy()">Save & Arm Rules</button>
   </div>
 
+  <!-- MANUAL BUTTONS -->
   <div class="card">
     <div style="font-size: 13px; font-weight: 600;">Manual / Instant Signal</div>
     <div class="grid">
@@ -352,9 +360,22 @@ HTML_CONTENT = """
     function toggle() {
       ws.send(JSON.stringify({ action: 'TOGGLE_MODE' }));
     }
-    function changeTicker(el) {
-      const [sym, disp] = el.value.split('|');
+    function setPreset(sym, disp) {
       ws.send(JSON.stringify({ action: 'CHANGE_SYMBOL', symbol: sym, display: disp }));
+    }
+    function loadCustomAsset() {
+      let input = document.getElementById('customSymbol').value.trim().toUpperCase();
+      if (!input) return;
+
+      let sym = input;
+      let disp = input;
+
+      // Automatically append .NS for Indian stocks if not provided
+      if (!input.includes('.') && !input.startsWith('^') && !input.includes('=')) {
+        sym = input + '.NS';
+      }
+      ws.send(JSON.stringify({ action: 'CHANGE_SYMBOL', symbol: sym, display: disp }));
+      document.getElementById('customSymbol').value = '';
     }
     function saveStrategy() {
       const payload = {
@@ -371,8 +392,3 @@ HTML_CONTENT = """
   </script>
 </body>
 </html>
-"""
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
