@@ -15,9 +15,19 @@ state = {
     "symbol": "^NSEI",
     "display_symbol": "NIFTY 50",
     "paper_balance": 100000.0,
-    "last_price": 24200.0,
+    "last_price": 23810.0,
     "positions": [],
-    "logs": ["Terminal operational. Polling market feed..."]
+    "logs": ["Engine armed. Breakout strategy loaded."],
+    # --- Breakout Strategy Rules ---
+    "strategy": {
+        "active": False,
+        "buy_above": 0.0,
+        "sell_below": 0.0,
+        "qty": 1,
+        "target_pts": 50.0,
+        "trailing_sl_pts": 25.0,
+        "highest_price_seen": 0.0
+    }
 }
 
 active_connections: List[WebSocket] = []
@@ -37,7 +47,6 @@ def log_event(message: str):
         state["logs"].pop()
 
 def fetch_price(symbol: str) -> float:
-    """Uses Python standard library (no pip packages required)."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -48,8 +57,70 @@ def fetch_price(symbol: str) -> float:
             if price:
                 return round(float(price), 2)
     except Exception as e:
-        logging.warning(f"Fetch note: {e}")
+        logging.warning(f"Price fetch: {e}")
     return 0.0
+
+def execute_paper_order(side: str, qty: int, price: float):
+    sym = state["display_symbol"]
+    if side == "BUY":
+        cost = price * qty
+        state["paper_balance"] -= cost
+        state["positions"].append({
+            "symbol": sym, "side": "BUY", "qty": qty, 
+            "entry_price": price, "ltp": price, "pnl": 0.0,
+            "peak_price": price
+        })
+        log_event(f"[AUTO-BUY] {qty}x {sym} @ ₹{price}")
+    elif side == "SELL" and state["positions"]:
+        p = state["positions"].pop(0)
+        pnl = round((price - p["entry_price"]) * p["qty"], 2)
+        state["paper_balance"] += (p["entry_price"] * p["qty"]) + pnl
+        log_event(f"[AUTO-SELL] {p['qty']}x {sym} @ ₹{price} | P&L: ₹{pnl}")
+
+def evaluate_strategy(price: float):
+    strat = state["strategy"]
+    if not strat["active"] or price <= 0:
+        return
+
+    # 1. Manage Existing Open Long Positions (Target & Trailing SL)
+    for pos in list(state["positions"]):
+        if pos["side"] == "BUY":
+            # Track peak price reached during trade
+            if price > pos.get("peak_price", pos["entry_price"]):
+                pos["peak_price"] = price
+
+            entry = pos["entry_price"]
+            peak = pos["peak_price"]
+            target = entry + strat["target_pts"]
+            trailing_stop = peak - strat["trailing_sl_pts"]
+
+            # Target hit
+            if price >= target:
+                execute_paper_order("SELL", pos["qty"], price)
+                log_event(f"🎯 Target hit at ₹{price} (+{strat['target_pts']} pts)!")
+                strat["active"] = False
+                return
+
+            # Trailing Stop-Loss hit
+            if price <= trailing_stop:
+                execute_paper_order("SELL", pos["qty"], price)
+                log_event(f"🛑 Trailing SL hit at ₹{price} (Peak: ₹{peak})")
+                strat["active"] = False
+                return
+
+    # 2. Check Breakout Entry if no open position
+    if len(state["positions"]) == 0:
+        # Buy breakout
+        if strat["buy_above"] > 0 and price >= strat["buy_above"]:
+            execute_paper_order("BUY", strat["qty"], price)
+            log_event(f"⚡ Breakout confirmed above ₹{strat['buy_above']}!")
+            # Reset triggers so it doesn't double enter
+            strat["buy_above"] = 0.0
+
+        # Sell below
+        elif strat["sell_below"] > 0 and price <= strat["sell_below"]:
+            log_event(f"⚠️ Breakdown alert: Price dropped below ₹{strat['sell_below']}")
+            strat["sell_below"] = 0.0
 
 async def feed_worker():
     while True:
@@ -57,12 +128,13 @@ async def feed_worker():
             p = await asyncio.to_thread(fetch_price, state["symbol"])
             if p > 0:
                 state["last_price"] = p
-            for pos in state["positions"]:
-                pos["ltp"] = state["last_price"]
-                pos["pnl"] = round((state["last_price"] - pos["entry_price"]) * pos["qty"], 2)
+                for pos in state["positions"]:
+                    pos["ltp"] = state["last_price"]
+                    pos["pnl"] = round((state["last_price"] - pos["entry_price"]) * pos["qty"], 2)
+                evaluate_strategy(p)
             await broadcast_state()
         except Exception as e:
-            logging.error(f"Worker loop: {e}")
+            logging.error(f"Worker loop error: {e}")
         await asyncio.sleep(4)
 
 @app.on_event("startup")
@@ -93,26 +165,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 p = await asyncio.to_thread(fetch_price, sym)
                 if p > 0:
                     state["last_price"] = p
+                    evaluate_strategy(p)
+
+            elif action == "SAVE_STRATEGY":
+                strat = state["strategy"]
+                strat["buy_above"] = float(cmd.get("buy_above", 0.0))
+                strat["sell_below"] = float(cmd.get("sell_below", 0.0))
+                strat["target_pts"] = float(cmd.get("target_pts", 50.0))
+                strat["trailing_sl_pts"] = float(cmd.get("trailing_sl_pts", 25.0))
+                strat["qty"] = int(cmd.get("qty", 1))
+                strat["active"] = bool(cmd.get("active", False))
+                status_txt = "ACTIVATED" if strat["active"] else "PAUSED"
+                log_event(f"Strategy rules saved & {status_txt}")
 
             elif action == "ORDER":
                 side = cmd.get("side")
                 qty = int(cmd.get("qty", 1))
-                sym = state["display_symbol"]
                 price = state["last_price"]
-
-                if side == "BUY":
-                    cost = price * qty
-                    state["paper_balance"] -= cost
-                    state["positions"].append({
-                        "symbol": sym, "side": "BUY", "qty": qty, 
-                        "entry_price": price, "ltp": price, "pnl": 0.0
-                    })
-                    log_event(f"[PAPER] Bought {qty} {sym} @ ₹{price}")
-                elif side == "SELL" and state["positions"]:
-                    p = state["positions"].pop(0)
-                    pnl = (price - p["entry_price"]) * p["qty"]
-                    state["paper_balance"] += (p["entry_price"] * p["qty"]) + pnl
-                    log_event(f"[PAPER] Sold {qty} {sym} @ ₹{price} | P&L: ₹{pnl:.2f}")
+                execute_paper_order(side, qty, price)
 
             await broadcast_state()
     except WebSocketDisconnect:
@@ -131,13 +201,15 @@ HTML_CONTENT = """
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Algo Terminal</title>
   <style>
-    :root { --bg: #090d16; --card: #131b2e; --border: #1f2b45; --up: #10b981; --down: #ef4444; --text: #f1f5f9; }
+    :root { --bg: #090d16; --card: #131b2e; --border: #1f2b45; --up: #10b981; --down: #ef4444; --text: #f1f5f9; --accent: #3b82f6; }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, system-ui, sans-serif; }
     body { background: var(--bg); color: var(--text); padding: 14px; }
     .header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
     .badge { padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; }
     .badge-paper { background: #3b82f633; color: #60a5fa; }
     .badge-live { background: #ef444433; color: #f87171; }
+    .badge-active { background: #10b98133; color: #34d399; }
+    .badge-idle { background: #64748b33; color: #94a3b8; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-top: 12px; }
     .price-lg { font-size: 32px; font-weight: 800; font-variant-numeric: tabular-nums; margin-top: 4px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
@@ -145,8 +217,11 @@ HTML_CONTENT = """
     .btn-buy { background: var(--up); }
     .btn-sell { background: var(--down); }
     .btn-mode { background: #1e293b; border: 1px solid var(--border); margin-top: 10px; }
+    .btn-save { background: var(--accent); margin-top: 12px; }
     .log-box { font-size: 12px; max-height: 140px; overflow-y: auto; background: #00000040; border-radius: 6px; padding: 8px; margin-top: 10px; line-height: 1.6; }
-    select { width: 100%; padding: 8px; background: #0b0f19; color: #fff; border: 1px solid var(--border); border-radius: 6px; margin-top: 6px; }
+    input, select { width: 100%; padding: 10px; background: #0b0f19; color: #fff; border: 1px solid var(--border); border-radius: 6px; margin-top: 4px; font-size: 14px; }
+    label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
+    .toggle-row { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
   </style>
 </head>
 <body>
@@ -158,7 +233,7 @@ HTML_CONTENT = """
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
       <span style="font-size: 12px; color: #94a3b8;" id="symLabel">NIFTY 50 (Live)</span>
-      <select id="tickerSelect" onchange="changeTicker(this)">
+      <select id="tickerSelect" style="width: auto; padding: 6px 10px;" onchange="changeTicker(this)">
         <option value="^NSEI|NIFTY 50">NIFTY 50</option>
         <option value="^NSEBANK|BANKNIFTY">BANKNIFTY</option>
         <option value="RELIANCE.NS|RELIANCE">RELIANCE</option>
@@ -166,8 +241,46 @@ HTML_CONTENT = """
         <option value="TCS.NS|TCS">TCS</option>
       </select>
     </div>
-    <div class="price-lg" id="ltp">₹24,200.00</div>
+    <div class="price-lg" id="ltp">₹23,810.00</div>
     <div style="font-size: 13px; margin-top: 6px;">Virtual Margin: <b id="bal">₹1,00,000</b></div>
+  </div>
+
+  <!-- AUTOMATED STRATEGY CARD -->
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-size: 14px; font-weight: 700;">⚡ Breakout Automation</span>
+      <span id="stratStatusBadge" class="badge badge-idle">PAUSED</span>
+    </div>
+    <p style="font-size: 11px; color: #94a3b8; margin-top: 4px;">Set rules once. Executes automatically when price levels hit.</p>
+
+    <div class="grid" style="margin-top: 10px;">
+      <div>
+        <label>Buy Above (₹)</label>
+        <input id="inBuyAbove" type="number" step="0.5" placeholder="e.g. 23850">
+      </div>
+      <div>
+        <label>Sell Below (₹)</label>
+        <input id="inSellBelow" type="number" step="0.5" placeholder="e.g. 23750">
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top: 8px;">
+      <div>
+        <label>Target (Points)</label>
+        <input id="inTarget" type="number" value="40">
+      </div>
+      <div>
+        <label>Trailing SL (Points)</label>
+        <input id="inSL" type="number" value="20">
+      </div>
+    </div>
+
+    <div class="toggle-row" style="margin-top: 12px;">
+      <label style="font-size: 13px; color: #fff;">Activate Strategy</label>
+      <input id="stratActive" type="checkbox" style="width: 22px; height: 22px;">
+    </div>
+
+    <button class="btn-save" onclick="saveStrategy()">Save & Arm Rules</button>
   </div>
 
   <div class="card">
@@ -192,6 +305,7 @@ HTML_CONTENT = """
   <script>
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     let ws = new WebSocket(`${proto}//${location.host}/ws`);
+    let stratLoaded = false;
 
     ws.onmessage = (e) => {
       const d = JSON.parse(e.data);
@@ -203,10 +317,28 @@ HTML_CONTENT = """
       badge.innerText = d.mode;
       badge.className = d.mode === 'LIVE' ? 'badge badge-live' : 'badge badge-paper';
 
+      const sBadge = document.getElementById('stratStatusBadge');
+      if (d.strategy.active) {
+        sBadge.innerText = 'ARMED';
+        sBadge.className = 'badge badge-active';
+      } else {
+        sBadge.innerText = 'PAUSED';
+        sBadge.className = 'badge badge-idle';
+      }
+
+      if (!stratLoaded && d.strategy) {
+        document.getElementById('inBuyAbove').value = d.strategy.buy_above || '';
+        document.getElementById('inSellBelow').value = d.strategy.sell_below || '';
+        document.getElementById('inTarget').value = d.strategy.target_pts || 40;
+        document.getElementById('inSL').value = d.strategy.trailing_sl_pts || 20;
+        document.getElementById('stratActive').checked = d.strategy.active;
+        stratLoaded = true;
+      }
+
       document.getElementById('count').innerText = d.positions.length;
       document.getElementById('positions').innerHTML = d.positions.length ? d.positions.map(p => 
         `<div style="display:flex; justify-content:space-between; margin-bottom:4px; color:#fff;">
-           <span>${p.qty}x ${p.symbol} @ ₹${p.entry_price.toFixed(1)}</span>
+           <span>${p.qty}x ${p.symbol} @ ₹${p.entry_price.toFixed(1)} (Peak ₹${(p.peak_price||p.entry_price).toFixed(1)})</span>
            <span style="color:${p.pnl >= 0 ? 'var(--up)':'var(--down)'}">₹${p.pnl.toFixed(2)}</span>
          </div>`
       ).join('') : 'No open trades.';
@@ -223,6 +355,18 @@ HTML_CONTENT = """
     function changeTicker(el) {
       const [sym, disp] = el.value.split('|');
       ws.send(JSON.stringify({ action: 'CHANGE_SYMBOL', symbol: sym, display: disp }));
+    }
+    function saveStrategy() {
+      const payload = {
+        action: 'SAVE_STRATEGY',
+        buy_above: document.getElementById('inBuyAbove').value,
+        sell_below: document.getElementById('inSellBelow').value,
+        target_pts: document.getElementById('inTarget').value,
+        trailing_sl_pts: document.getElementById('inSL').value,
+        active: document.getElementById('stratActive').checked,
+        qty: 1
+      };
+      ws.send(JSON.stringify(payload));
     }
   </script>
 </body>
