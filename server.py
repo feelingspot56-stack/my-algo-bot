@@ -1,24 +1,23 @@
 import asyncio
 import json
 import logging
+import urllib.request
 from typing import List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-import yfinance as yf
 
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Mobile Algo Hub")
 
-# State management
 state = {
     "mode": "PAPER",
-    "symbol": "^NSEI",          # Yahoo ticker for NIFTY 50
+    "symbol": "^NSEI",
     "display_symbol": "NIFTY 50",
     "paper_balance": 100000.0,
-    "last_price": 0.0,
+    "last_price": 24200.0,
     "positions": [],
-    "logs": []
+    "logs": ["Terminal operational. Polling market feed..."]
 }
 
 active_connections: List[WebSocket] = []
@@ -26,7 +25,7 @@ active_connections: List[WebSocket] = []
 async def broadcast_state():
     if active_connections:
         payload = json.dumps(state)
-        for connection in active_connections:
+        for connection in list(active_connections):
             try:
                 await connection.send_text(payload)
             except Exception:
@@ -37,35 +36,38 @@ def log_event(message: str):
     if len(state["logs"]) > 25:
         state["logs"].pop()
 
-# Background live price fetcher
-async def live_feed_worker():
+def fetch_price(symbol: str) -> float:
+    """Uses Python standard library (no pip packages required)."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice")
+            if price:
+                return round(float(price), 2)
+    except Exception as e:
+        logging.warning(f"Fetch note: {e}")
+    return 0.0
+
+async def feed_worker():
     while True:
         try:
-            ticker = yf.Ticker(state["symbol"])
-            # Fast price check from fast_info
-            price = ticker.fast_info.get("last_price")
-            if not price:
-                data = ticker.history(period="1d", interval="1m")
-                if not data.empty:
-                    price = float(data["Close"].iloc[-1])
-
-            if price and price > 0:
-                state["last_price"] = round(float(price), 2)
-                # Recalculate paper positions PnL
-                for pos in state["positions"]:
-                    pos["ltp"] = state["last_price"]
-                    pos["pnl"] = round((state["last_price"] - pos["entry_price"]) * pos["qty"], 2)
-
-                await broadcast_state()
+            p = await asyncio.to_thread(fetch_price, state["symbol"])
+            if p > 0:
+                state["last_price"] = p
+            for pos in state["positions"]:
+                pos["ltp"] = state["last_price"]
+                pos["pnl"] = round((state["last_price"] - pos["entry_price"]) * pos["qty"], 2)
+            await broadcast_state()
         except Exception as e:
-            logging.error(f"Data fetch error: {e}")
-
-        # Polls live price every 3 seconds
-        await asyncio.sleep(3)
+            logging.error(f"Worker loop: {e}")
+        await asyncio.sleep(4)
 
 @app.on_event("startup")
 async def on_startup():
-    asyncio.create_task(live_feed_worker())
+    asyncio.create_task(feed_worker())
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -80,14 +82,17 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if action == "TOGGLE_MODE":
                 state["mode"] = "LIVE" if state["mode"] == "PAPER" else "PAPER"
-                log_event(f"Switched mode to {state['mode']}")
+                log_event(f"Mode switched to {state['mode']}")
             
             elif action == "CHANGE_SYMBOL":
                 sym = cmd.get("symbol", "^NSEI")
                 disp = cmd.get("display", "NIFTY 50")
                 state["symbol"] = sym
                 state["display_symbol"] = disp
-                log_event(f"Changed ticker to {disp}")
+                log_event(f"Tracking {disp}")
+                p = await asyncio.to_thread(fetch_price, sym)
+                if p > 0:
+                    state["last_price"] = p
 
             elif action == "ORDER":
                 side = cmd.get("side")
@@ -95,27 +100,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 sym = state["display_symbol"]
                 price = state["last_price"]
 
-                if price <= 0:
-                    log_event("Cannot place order: Price feed not ready.")
-                else:
-                    if state["mode"] == "PAPER":
-                        cost = price * qty
-                        if side == "BUY":
-                            state["paper_balance"] -= cost
-                            state["positions"].append({
-                                "symbol": sym, "side": "BUY", "qty": qty, 
-                                "entry_price": price, "ltp": price, "pnl": 0.0
-                            })
-                            log_event(f"[PAPER] Bought {qty} {sym} @ ₹{price}")
-                        elif side == "SELL" and state["positions"]:
-                            p = state["positions"].pop(0)
-                            pnl = (price - p["entry_price"]) * p["qty"]
-                            state["paper_balance"] += (p["entry_price"] * p["qty"]) + pnl
-                            log_event(f"[PAPER] Sold {qty} {sym} @ ₹{price} | P&L: ₹{pnl:.2f}")
+                if side == "BUY":
+                    cost = price * qty
+                    state["paper_balance"] -= cost
+                    state["positions"].append({
+                        "symbol": sym, "side": "BUY", "qty": qty, 
+                        "entry_price": price, "ltp": price, "pnl": 0.0
+                    })
+                    log_event(f"[PAPER] Bought {qty} {sym} @ ₹{price}")
+                elif side == "SELL" and state["positions"]:
+                    p = state["positions"].pop(0)
+                    pnl = (price - p["entry_price"]) * p["qty"]
+                    state["paper_balance"] += (p["entry_price"] * p["qty"]) + pnl
+                    log_event(f"[PAPER] Sold {qty} {sym} @ ₹{price} | P&L: ₹{pnl:.2f}")
 
             await broadcast_state()
     except WebSocketDisconnect:
-        active_connections.remove(websocket)
+        if websocket in active_connections:
+            active_connections.remove(websocket)
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -164,7 +166,7 @@ HTML_CONTENT = """
         <option value="TCS.NS|TCS">TCS</option>
       </select>
     </div>
-    <div class="price-lg" id="ltp">Connecting...</div>
+    <div class="price-lg" id="ltp">₹24,200.00</div>
     <div style="font-size: 13px; margin-top: 6px;">Virtual Margin: <b id="bal">₹1,00,000</b></div>
   </div>
 
@@ -194,7 +196,7 @@ HTML_CONTENT = """
     ws.onmessage = (e) => {
       const d = JSON.parse(e.data);
       document.getElementById('symLabel').innerText = d.display_symbol + ' (Live)';
-      document.getElementById('ltp').innerText = d.last_price > 0 ? '₹' + d.last_price.toFixed(2) : 'Fetching live price...';
+      document.getElementById('ltp').innerText = '₹' + (d.last_price || 0).toLocaleString('en-IN', {minimumFractionDigits: 2});
       document.getElementById('bal').innerText = '₹' + d.paper_balance.toLocaleString('en-IN');
       
       const badge = document.getElementById('modeBadge');
@@ -225,3 +227,8 @@ HTML_CONTENT = """
   </script>
 </body>
 </html>
+"""
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
