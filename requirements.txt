@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+kiteconnect
+websockets
+python-multipart
+jinja2
+yfinance
+pandas
