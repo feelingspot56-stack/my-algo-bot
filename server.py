@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 import json
 import logging
 import urllib.request
@@ -22,10 +23,12 @@ state = {
         "active": False,
         "buy_above": 0.0,
         "sell_below": 0.0,
-        "qty": 1,
+        "qty": 10,
         "target_pts": 5.0,
-        "trailing_sl_pts": 2.0
-    }
+        "trailing_sl_pts": 2.0,
+        "armed_time": None
+    },
+    "trigger_history": []
 }
 
 active_connections: List[WebSocket] = []
@@ -81,28 +84,42 @@ def fetch_price(symbol: str) -> float:
         logging.warning(f"Price fetch failed for {symbol}: {e}")
     return 0.0
 
-def execute_paper_order(side: str, qty: int, price: float):
+def execute_paper_order(side: str, qty: int, price: float, reason: str = "MANUAL"):
     sym = state["display_symbol"]
+    timestamp = datetime.now().strftime("%H:%M:%S")
+
     if side == "BUY":
         cost = price * qty
         state["paper_balance"] -= cost
         state["positions"].append({
             "symbol": sym, "side": "BUY", "qty": qty, 
             "entry_price": price, "ltp": price, "pnl": 0.0,
-            "peak_price": price
+            "peak_price": price, "time": timestamp
         })
-        log_event(f"[AUTO-BUY] {qty}x {sym} @ ₹{price}")
+        log_event(f"[{reason}-BUY] {qty}x {sym} @ ₹{price}")
+        state["trigger_history"].insert(0, {
+            "time": timestamp, "symbol": sym, "action": "BUY",
+            "qty": qty, "price": price, "reason": reason, "pnl": "-"
+        })
     elif side == "SELL" and state["positions"]:
         p = state["positions"].pop(0)
         pnl = round((price - p["entry_price"]) * p["qty"], 2)
         state["paper_balance"] += (p["entry_price"] * p["qty"]) + pnl
-        log_event(f"[AUTO-SELL] {p['qty']}x {sym} @ ₹{price} | P&L: ₹{pnl}")
+        log_event(f"[{reason}-SELL] {p['qty']}x {sym} @ ₹{price} | P&L: ₹{pnl}")
+        state["trigger_history"].insert(0, {
+            "time": timestamp, "symbol": sym, "action": "SELL",
+            "qty": p["qty"], "price": price, "reason": reason, "pnl": f"₹{pnl:+.2f}"
+        })
+
+    if len(state["trigger_history"]) > 20:
+        state["trigger_history"].pop()
 
 def evaluate_strategy(price: float):
     strat = state["strategy"]
     if not strat.get("active", False) or price <= 0:
         return
 
+    # 1. Manage Exits (Target & Trailing SL)
     for pos in list(state["positions"]):
         if pos["side"] == "BUY":
             if price > pos.get("peak_price", pos["entry_price"]):
@@ -114,24 +131,26 @@ def evaluate_strategy(price: float):
             trailing_stop = peak - strat["trailing_sl_pts"]
 
             if price >= target:
-                execute_paper_order("SELL", pos["qty"], price)
-                log_event(f"🎯 Target hit at ₹{price} (+{strat['target_pts']} pts)!")
+                execute_paper_order("SELL", pos["qty"], price, reason="TARGET")
+                log_event(f"🎯 Target reached at ₹{price} (+{strat['target_pts']} pts)!")
                 strat["active"] = False
                 return
 
             if price <= trailing_stop:
-                execute_paper_order("SELL", pos["qty"], price)
+                execute_paper_order("SELL", pos["qty"], price, reason="TRAIL-SL")
                 log_event(f"🛑 Trailing SL hit at ₹{price} (Peak: ₹{peak})")
                 strat["active"] = False
                 return
 
+    # 2. Manage Entries
     if len(state["positions"]) == 0:
+        qty = int(strat.get("qty", 1))
         if strat["buy_above"] > 0 and price >= strat["buy_above"]:
-            execute_paper_order("BUY", strat["qty"], price)
-            log_event(f"⚡ Breakout triggered above ₹{strat['buy_above']}!")
+            execute_paper_order("BUY", qty, price, reason="BREAKOUT")
+            log_event(f"⚡ Breakout triggered: Bought {qty}x {state['display_symbol']} @ ₹{price}")
             strat["buy_above"] = 0.0
         elif strat["sell_below"] > 0 and price <= strat["sell_below"]:
-            log_event(f"⚠️ Price broke below ₹{strat['sell_below']}")
+            log_event(f"⚠️ Price fell below ₹{strat['sell_below']}")
             strat["sell_below"] = 0.0
 
 async def feed_worker():
@@ -201,17 +220,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 strat["sell_below"] = float(cmd.get("sell_below") or 0.0)
                 strat["target_pts"] = float(cmd.get("target_pts") or 5.0)
                 strat["trailing_sl_pts"] = float(cmd.get("trailing_sl_pts") or 2.0)
-                strat["qty"] = int(cmd.get("qty") or 1)
+                strat["qty"] = max(1, int(cmd.get("qty") or 1))
                 strat["active"] = bool(cmd.get("active", True))
+                strat["armed_time"] = datetime.now().strftime("%d-%b %H:%M:%S") if strat["active"] else None
                 status_txt = "ARMED" if strat["active"] else "PAUSED"
-                log_event(f"Rules set for {state['display_symbol']} & {status_txt}")
+                log_event(f"Rules armed for {strat['qty']}x {state['display_symbol']} & {status_txt}")
                 evaluate_strategy(state["last_price"])
 
             elif action == "ORDER":
                 side = cmd.get("side")
-                qty = int(cmd.get("qty", 1))
+                qty = max(1, int(cmd.get("qty", 1)))
                 price = state["last_price"]
-                execute_paper_order(side, qty, price)
+                execute_paper_order(side, qty, price, reason="MANUAL")
 
             await broadcast_state()
     except WebSocketDisconnect:
@@ -249,6 +269,9 @@ HTML_CONTENT = """<!DOCTYPE html>
     .toggle-row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
     .quick-chips { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin-top: 8px; }
     .chip { background: #1e293b; padding: 6px 12px; border-radius: 6px; font-size: 12px; white-space: nowrap; cursor: pointer; border: 1px solid var(--border); }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+    th { text-align: left; padding: 6px 4px; color: #94a3b8; font-weight: 600; border-bottom: 1px solid var(--border); }
+    td { padding: 8px 4px; border-bottom: 1px solid #1f2b4533; }
   </style>
 </head>
 <body>
@@ -306,12 +329,17 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="grid" style="margin-top: 8px;">
       <div>
         <label>Target (Points / ₹)</label>
-        <input id="inTarget" type="number" step="0.05" value="2">
+        <input id="inTarget" type="number" step="0.05" value="5">
       </div>
       <div>
         <label>Trailing SL (Points / ₹)</label>
-        <input id="inSL" type="number" step="0.05" value="1">
+        <input id="inSL" type="number" step="0.05" value="2">
       </div>
+    </div>
+
+    <div style="margin-top: 8px;">
+      <label>Order Quantity (Shares / Lots)</label>
+      <input id="inQty" type="number" min="1" step="1" value="10" placeholder="e.g. 10 or 100">
     </div>
 
     <div class="toggle-row">
@@ -320,6 +348,33 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
 
     <button id="btnSave" class="btn-save" onclick="saveStrategy()">Save & Arm Rules</button>
+  </div>
+
+  <!-- ACTIVE RULE & TRIGGER HISTORY CARD -->
+  <div class="card">
+    <div style="font-size: 13px; font-weight: 600;">Active Armed Rule</div>
+    <div id="activeRuleSummary" style="margin-top: 6px; font-size: 12px; color: #cbd5e1; background: #0b0f19; padding: 8px; border-radius: 6px;">
+      No active strategy rules armed.
+    </div>
+
+    <div style="font-size: 13px; font-weight: 600; margin-top: 14px;">Trigger & Order History</div>
+    <div style="max-height: 180px; overflow-y: auto;">
+      <table id="historyTable">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Asset</th>
+            <th>Type</th>
+            <th>Qty</th>
+            <th>Price</th>
+            <th>P&L</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody">
+          <tr><td colspan="6" style="text-align:center; color:#94a3b8;">No trigger executions recorded yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <!-- MANUAL BUTTONS -->
@@ -368,15 +423,51 @@ HTML_CONTENT = """<!DOCTYPE html>
         sBadge.className = 'badge badge-idle';
       }
 
+      // Populate input values once initially
       if (!stratLoaded && d.strategy) {
         if (d.strategy.buy_above) document.getElementById('inBuyAbove').value = d.strategy.buy_above;
         if (d.strategy.sell_below) document.getElementById('inSellBelow').value = d.strategy.sell_below;
-        document.getElementById('inTarget').value = d.strategy.target_pts || 2;
-        document.getElementById('inSL').value = d.strategy.trailing_sl_pts || 1;
+        document.getElementById('inTarget').value = d.strategy.target_pts || 5;
+        document.getElementById('inSL').value = d.strategy.trailing_sl_pts || 2;
+        document.getElementById('inQty').value = d.strategy.qty || 10;
         document.getElementById('stratActive').checked = Boolean(d.strategy.active);
         stratLoaded = true;
       }
 
+      // Render Active Rule Summary
+      const summaryDiv = document.getElementById('activeRuleSummary');
+      if (d.strategy && d.strategy.active) {
+        summaryDiv.innerHTML = `
+          <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+            <b>${d.strategy.qty || 1}x ${d.display_symbol}</b>
+            <span style="color:#34d399; font-weight:bold;">ARMED</span>
+          </div>
+          <div>• Buy Above: <b>₹${d.strategy.buy_above || 'N/A'}</b> | Sell Below: <b>₹${d.strategy.sell_below || 'N/A'}</b></div>
+          <div>• Target: <b>+${d.strategy.target_pts} pts</b> | Trailing SL: <b>-${d.strategy.trailing_sl_pts} pts</b></div>
+          <div style="color:#64748b; font-size:11px; margin-top:4px;">Armed at: ${d.strategy.armed_time || 'Active session'}</div>
+        `;
+      } else {
+        summaryDiv.innerHTML = '<span style="color:#94a3b8;">No active breakout rules armed. Enter figures and tap Save & Arm.</span>';
+      }
+
+      // Render Trigger History Table
+      const historyBody = document.getElementById('historyBody');
+      if (d.trigger_history && d.trigger_history.length > 0) {
+        historyBody.innerHTML = d.trigger_history.map(h => `
+          <tr>
+            <td>${h.time}</td>
+            <td><b>${h.symbol}</b></td>
+            <td style="color:${h.action === 'BUY' ? 'var(--up)' : 'var(--down)'}; font-weight:bold;">${h.action} (${h.reason})</td>
+            <td>${h.qty}</td>
+            <td>₹${h.price.toFixed(2)}</td>
+            <td style="color:${h.pnl.includes('-') && h.pnl !== '-' ? 'var(--down)' : 'var(--up)'}">${h.pnl}</td>
+          </tr>
+        `).join('');
+      } else {
+        historyBody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#94a3b8;">No trigger executions recorded yet.</td></tr>';
+      }
+
+      // Render Open Positions
       document.getElementById('count').innerText = d.positions.length;
       document.getElementById('positions').innerHTML = d.positions.length ? d.positions.map(p => 
         `<div style="display:flex; justify-content:space-between; margin-bottom:4px; color:#fff;">
@@ -386,14 +477,14 @@ HTML_CONTENT = """<!DOCTYPE html>
       ).join('') : 'No open trades.';
 
       document.getElementById('logs').innerHTML = d.logs.map(l => `<div>• ${l}</div>`).join('');
-      
-      // Always reset the load button text back to Load
+
       const loadBtn = document.getElementById('loadBtn');
       if (loadBtn) loadBtn.innerText = 'Load';
     };
 
     function order(side) {
-      ws.send(JSON.stringify({ action: 'ORDER', side, qty: 1 }));
+      const q = parseInt(document.getElementById('inQty').value) || 1;
+      ws.send(JSON.stringify({ action: 'ORDER', side, qty: q }));
     }
     function toggle() {
       ws.send(JSON.stringify({ action: 'TOGGLE_MODE' }));
@@ -414,9 +505,10 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById('customSymbol').value = '';
     }
     function saveStrategy() {
-      // Force checkbox to true when Save & Arm is clicked
       const chk = document.getElementById('stratActive');
       chk.checked = true;
+
+      const qtyVal = parseInt(document.getElementById('inQty').value) || 1;
 
       const btn = document.getElementById('btnSave');
       btn.innerText = 'Armed & Saved!';
@@ -436,8 +528,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         sell_below: parseFloat(document.getElementById('inSellBelow').value) || 0.0,
         target_pts: parseFloat(document.getElementById('inTarget').value) || 5.0,
         trailing_sl_pts: parseFloat(document.getElementById('inSL').value) || 2.0,
-        active: true,
-        qty: 1
+        qty: qtyVal,
+        active: true
       };
       ws.send(JSON.stringify(payload));
     }
